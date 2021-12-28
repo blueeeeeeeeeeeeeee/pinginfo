@@ -1,0 +1,316 @@
+#!/usr/bin/python
+import os,time,signal,sys
+import threading
+if sys.version_info[0] == 2:
+    def input(raw_input):
+        return raw_input()
+ 
+PING_TIMEOUT = 2
+PING_INTERVAL = 1
+PRINT_INTERVAL = 1
+LIST_FILE = 'list.txt'
+ 
+is_ping_running = 1
+threads = []
+ 
+class Ping_thread(threading.Thread):
+    def __init__(self, id, result):
+        threading.Thread.__init__(self)
+        self.id = id
+        self.result = result
+        self.ip = result.get_host_ip_by_id(id)
+    def run(self):
+        try:
+            while is_ping_running:
+                end_time = time.time() + PING_INTERVAL
+ 
+                cmd = 'ping -c 1 -W %s %s' %(PING_TIMEOUT, self.ip)
+                r = os.popen(cmd)
+                info = r.readlines()
+                ping_loss = info[-2].split(" ")[5]
+                ping_rtt = 0.0
+                ping_ttl = 0
+                if ping_loss == '0%':
+                    ping_status = 1
+                    ping_rtt = float(info[-5].split(" ")[6].lstrip("time="))
+                    ping_ttl = int(info[-5].split(" ")[5].lstrip("ttl="))
+                else:
+                    ping_status = 0
+                self.result.update_host_info_by_ip(self.ip, ping_status, ping_rtt, ping_ttl)
+ 
+                remaining = end_time - time.time()
+                if remaining > 0:
+                    time.sleep(remaining)
+        except Exception as e:
+            print('Thread-ping{0} ERROR:{1}'.format(self.id, e))
+ 
+ 
+class Printer_thread(threading.Thread):
+    def __init__(self, result, info=''):
+        threading.Thread.__init__(self)
+        self.result = result
+        self.info = info
+    def run(self):
+        try:
+            while is_ping_running:
+                time.sleep(1)
+                hosts_info_list = self.result.get_hosts_info_list()
+                os.system('clear')
+                print("\033[7mI\033[0mP:             "
+                    "Aging "
+                    "Last_Status "
+                    "\033[7mC\033[0mount  "
+                    "Fail  "
+                    "Last_\033[7mR\033[0mTT  "
+                    "Last_\033[7mT\033[0mTL  "
+                    "Succ_Rate_\033[7mM\033[0mA "
+                    "Succ_Rate_\033[7mA\033[0mV "
+                    "Last_Succ_Time   "
+                    "Last_Fail_Time   ")
+                for host_info in hosts_info_list:
+                    print ('{color}{IP:15} {Aging:5} {Last_Status:11} {Count:6} {Fail:5} {Last_RTT:9} {Last_TTL:9} {Succ_Rate_MA:12} {Succ_Rate_AV:12} {Last_Succ_Time:16} {Last_Fail_Time:16}\033[0m'.format(**host_info))
+                print('{0}'.format(self.info))
+        except Exception as e:
+            print('Thread-Printer ERROR:{0}'.format(e))
+ 
+ 
+class Result():
+    def __init__(self):
+        self.hosts_dict = {}
+        self.sort_by_list = []
+        self.sort_by_ip = []
+        self.sort_by_success_rate_ma = []
+        self.sort_by_success_rate_av = []
+        self.current_sort = self.sort_by_list
+        self.current_sort_method = 'list'
+ 
+    @classmethod
+    def _ipencode(cls, ipaddr):
+        ipnum = 0
+        for i in ipaddr.split('.'):
+            ipnum = ipnum * 256 + int(i)
+        return ipnum
+ 
+    @classmethod
+    def _ipdecode(cls, ipnum):
+        ipaddr = ''
+        for _ in range(4):
+            chunk, ipnum = divmod(ipnum, 255)
+            ipaddr.join(str(chunk))
+        return ipnum
+ 
+    class Host():
+        status = ['timeout', 'success']
+        def __init__(self, ip='1.1.1.1'):
+            self.__ip = ip
+            self.__ipnum = Result._ipencode(ip)
+            self.aging = 1
+            self.count = 0
+            self.succ_count = 0
+            self.fail_count = 0
+            self.last_ping_status = 0
+            self.last_ping_rtt = 0.0   # ms
+            self.last_ping_ttl = 0
+            self.success_rate_ma = 0.95  # 95% initial success rate
+            self.success_rate_av = 0.0
+            self.last_success_time = 0.0
+            self.last_fail_time = 0.0
+ 
+        def update_info(self, last_ping_status, last_ping_rtt, last_ping_ttl):
+            self.last_ping_status = last_ping_status
+            self.success_rate_av = (self.success_rate_av*self.count + last_ping_status) / (self.count+1.0)
+            if last_ping_status == 1:
+                self.success_rate_ma += (1 - self.success_rate_ma) * 0.75
+                self.last_success_time = time.time()
+                self.last_ping_rtt = last_ping_rtt
+                self.last_ping_ttl = last_ping_ttl
+                self.succ_count += 1
+            else:
+                self.success_rate_ma *= (self.success_rate_ma ** 2) * 0.99
+                self.last_fail_time = time.time()
+                self.fail_count += 1
+            self.aging = 0
+            self.count += 1
+ 
+        def get_info(self):
+            self.aging += 1
+            if self.success_rate_ma < 0.95:
+                color = '\033[1;31m'
+            else:
+                color = ''
+            return {'IP' : self.__ip,
+                    'IP_NUM' : self.__ipnum,
+                    'Aging' : '{0}'.format(self.aging),
+                    'Count' : '{0}'.format(self.count),
+                    'Succ' : '{0}'.format(self.succ_count),
+                    'Fail' : '{0}'.format(self.fail_count),
+                    'Last_Status' : Result.Host.status[self.last_ping_status],
+                    'Last_RTT' : '{0}'.format(self.last_ping_rtt),
+                    'Last_TTL' : '{0}'.format(self.last_ping_ttl),
+                    'Succ_Rate_MA' : '{0:.2%}'.format(self.success_rate_ma),
+                    'Succ_Rate_AV' : '{0:.2%}'.format(self.success_rate_av),
+                    'Last_Succ_Time' : '{0}'.format(time.strftime("%m-%d %H:%M:%S", time.localtime(self.last_success_time))),
+                    'Last_Fail_Time' : '{0}'.format(time.strftime("%m-%d %H:%M:%S", time.localtime(self.last_fail_time))),
+                    'color' : color
+                    }
+ 
+        def get_info_raw(self):
+            self.aging += 1
+            if self.success_rate_ma < 0.95:
+                color = '\033[1;31m'
+            else:
+                color = ''
+            return {'ip' : self.__ip,
+                    'ipnum' : self.__ipnum,
+                    'aging' : self.aging,
+                    'count' : self.count,
+                    'succ_count' : self.succ_count,
+                    'fail_count' : self.fail_count,
+                    'last_ping_status' : self.last_ping_status,
+                    'last_ping_rtt' : self.last_ping_rtt,
+                    'last_ping_ttl' : self.last_ping_ttl,
+                    'success_rate_ma' : self.success_rate_ma,
+                    'success_rate_av' : self.success_rate_av,
+                    'last_success_time' : self.last_success_time,
+                    'last_fail_time' : self.last_fail_time,
+                    'color' : color
+                    }
+ 
+    def add_host(self, ip):
+        self.hosts_dict[ip] = Result.Host(ip)
+        self.sort_by_list.append(ip)
+         
+    def set_sort(self, method='list'):
+        if method == self.current_sort_method:
+            self.current_sort.reverse()
+            return
+        if method == 'list':
+            self.current_sort = self.sort_by_list
+        elif method == 'ipnum':
+            self.sort_by_ip = sorted(self.hosts_dict, key=lambda ip: self.hosts_dict[ip].get_info_raw()['ipnum'])
+            self.current_sort = self.sort_by_ip
+        elif method == 'count':
+            self.sort_by_ip = sorted(self.hosts_dict, key=lambda ip: self.hosts_dict[ip].get_info_raw()['count'])
+            self.current_sort = self.sort_by_ip
+        elif method == 'last_ping_rtt':
+            self.sort_by_ip = sorted(self.hosts_dict, key=lambda ip: self.hosts_dict[ip].get_info_raw()['last_ping_rtt'])
+            self.current_sort = self.sort_by_ip
+        elif method == 'last_ping_ttl':
+            self.sort_by_ip = sorted(self.hosts_dict, key=lambda ip: self.hosts_dict[ip].get_info_raw()['last_ping_ttl'])
+            self.current_sort = self.sort_by_ip
+        elif method == 'success_rate_ma':
+            self.sort_by_success_rate_ma = sorted(self.hosts_dict, key=lambda ip: self.hosts_dict[ip].get_info_raw()['success_rate_ma'])
+            self.current_sort = self.sort_by_success_rate_ma
+        elif method == 'success_rate_av':
+            self.sort_by_success_rate_av = sorted(self.hosts_dict, key=lambda ip: self.hosts_dict[ip].get_info_raw()['success_rate_av'])
+            self.current_sort = self.sort_by_success_rate_av
+        else:
+            return
+        self.current_sort_method = method
+ 
+    def get_host_count(self):
+        return len(self.hosts_dict)
+ 
+    def get_hosts_info_list(self):
+        hosts_info_list = []
+        for ip in self.current_sort:
+            hosts_info_list.append(self.hosts_dict[ip].get_info())
+        return hosts_info_list
+ 
+    def get_host_by_ip(self, ip):
+        return self.hosts_dict[ip]
+ 
+    def get_host_ip_by_id(self, id):
+        return self.sort_by_list[id]
+ 
+    def get_host_info_by_ip(self, ip):
+        return self.hosts_dict[ip].get_info()
+ 
+    def update_host_info_by_ip(self, ip,
+                               last_ping_status,
+                               last_ping_rtt,
+                               last_ping_ttl):
+        self.hosts_dict[ip].update_info(last_ping_status,
+                                        last_ping_rtt,
+                                        last_ping_ttl)
+ 
+ 
+def main():
+    f = open(LIST_FILE)
+    ips = f.readlines()
+    result = Result()
+    global threads
+    for ip in ips:
+        ip = ip.split('#')[0].strip()
+        if ip != "":
+            result.add_host(ip)
+    if result.get_host_count() > 100:
+        print('Too many target IP, please reduce to less than 100')
+        return
+ 
+    try:
+        for i in range(result.get_host_count()):
+            thread = Ping_thread(i, result)
+            thread.setDaemon(True)
+            thread.start()
+            threads.append(thread)
+        info = "type `q + Enter` for quit. If you want sort result, Look title, It's easy for smart you! (`0 + Enter` is defualt order)."
+        printer = Printer_thread(result, info)
+        printer.setDaemon(True)
+        printer.start()
+        threads.append(printer)
+        while 1:
+            cmd = input()
+            if cmd[-1:].lower() == 'q':
+                clear_thread()
+                break
+            elif cmd[-1:].lower() == 'i':
+                result.set_sort('ipnum')
+            elif cmd[-1:].lower() == 'c':
+                result.set_sort('count')
+            elif cmd[-1:].lower() == 'r':
+                result.set_sort('last_ping_trr')
+            elif cmd[-1:].lower() == 't':
+                result.set_sort('last_ping_ttl')
+            elif cmd[-1:].lower() == 'm':
+                result.set_sort('success_rate_ma')
+            elif cmd[-1:].lower() == 'a':
+                result.set_sort('success_rate_av')
+            elif cmd[-1:] == '0':
+                result.set_sort('list')
+            # elif cmd[-1:] == 'c':
+            #     raise RuntimeError('aaaa')
+            else:
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        print('User press ^c ...')
+        clear_thread()
+ 
+ 
+def clear_thread():
+    global is_ping_running
+    is_ping_running = 0
+    for thread in threads:
+        thread.join()
+    print('all ping process is stop')
+ 
+def main_argv_check():
+    global LIST_FILE
+    if len(sys.argv) == 2:
+        LIST_FILE = sys.argv[1]
+    elif len(sys.argv) == 1:
+        print('Will use the default configuration, list_file={0}'.format(LIST_FILE))
+    else:
+        print('  usage:')
+        print('      {0} <CR>'.format(sys.argv[0]))
+        print('      {0} <path/list_file> <CR>'.format(sys.argv[0]))
+        print('  E.g {0} list2.txt'.format(sys.argv[0]))
+        exit()
+ 
+if __name__ == '__main__':
+    main_argv_check()
+    try:
+        main()
+    except Exception as e:
+        clear_thread()
+        print('Exception:{0}'.format(e))
